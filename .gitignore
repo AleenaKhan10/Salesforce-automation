@@ -15,8 +15,10 @@ env/
 ENV/
 
 # IDE
-.vscode/
 .idea/
+# Keep .vscode/launch.json for debug configs
+.vscode/*
+!.vscode/launch.json
 
 # Logs
 *.log

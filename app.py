@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 
 # Real job modules (run-once wrappers)
-from . import prop_main_test
-from . import contact_main
+import prop_main_test
+import contact_main
 
 # Load variables from .env in the current working directory (if present)
 load_dotenv()
