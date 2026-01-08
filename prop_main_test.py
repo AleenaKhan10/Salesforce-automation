@@ -302,7 +302,9 @@ def find_property_match(sf: Salesforce, new_record: Dict) -> Tuple[Optional[str]
 
     city = (new_record.get('City__c') or "").replace("'", "\\'")
     state = (new_record.get('State__c') or "").replace("'", "\\'")
-    zipc = re.sub(r'\D','', str(new_record.get('Zip__c') or ""))[:9]
+    # Normalize ZIP to first 5 digits only to avoid ZIP+4 mismatch issues
+    # e.g., "773731234" and "77373" should both match
+    zipc = re.sub(r'\D','', str(new_record.get('Zip__c') or ""))[:5]
 
     where = ["(Parcel_ID__c != null OR Left_Main__Address__c != null)"]
 
@@ -315,7 +317,8 @@ def find_property_match(sf: Salesforce, new_record: Dict) -> Tuple[Optional[str]
     if state:
         where.append(f"Left_Main__State__c = '{state}'")
     if zipc:
-        where.append(f"Left_Main__Zip_Code__c = '{zipc}'")
+        # Use LIKE to match both 5-digit and ZIP+4 formats
+        where.append(f"Left_Main__Zip_Code__c LIKE '{zipc}%'")
 
     query = f"""
       SELECT Id, Parcel_ID__c, Left_Main__Address__c, Legal_Description__c,
