@@ -301,13 +301,72 @@ class ParsedLegalDescription:
     raw: str = ""
 
 
+def _fuzzy_keyword_match(word: str, target: str, threshold: int = 70) -> bool:
+    """
+    Check if a word fuzzy-matches a target keyword.
+    Handles typos like "Bolck" -> "Block", "Lto" -> "Lot", etc.
+    """
+    if not word:
+        return False
+    word_lower = word.lower()
+    target_lower = target.lower()
+
+    # Exact match first
+    if word_lower == target_lower:
+        return True
+
+    # Use fuzzywuzzy ratio for similarity
+    score = fuzz.ratio(word_lower, target_lower)
+    return score >= threshold
+
+
+def _find_fuzzy_keyword_with_number(text: str, keywords: List[str], threshold: int = 70) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Find a keyword (with fuzzy matching) followed by a number in the text.
+    Returns (number_str, end_position) or (None, None) if not found.
+
+    Examples:
+        "Lot 5 Block 2" with keywords=["lot"] -> ("5", position_after_5)
+        "Bolck 2 Atascocita" with keywords=["block", "blk"] -> ("2", position_after_2)
+    """
+    # Split text into tokens while preserving positions
+    tokens = re.findall(r'\S+', text)
+
+    for i, token in enumerate(tokens):
+        # Check if this token fuzzy-matches any of our keywords
+        for keyword in keywords:
+            if _fuzzy_keyword_match(token, keyword, threshold):
+                # Look for a number immediately after or attached
+                # Case 1: Number is part of the same token (e.g., "Lot26")
+                num_in_token = re.search(r'(\d+)', token)
+                if num_in_token and token.lower() != keyword.lower():
+                    # Number attached to keyword
+                    return num_in_token.group(1), None
+
+                # Case 2: Number is the next token
+                if i + 1 < len(tokens):
+                    next_token = tokens[i + 1]
+                    num_match = re.match(r'^(\d+)', next_token)
+                    if num_match:
+                        # Find the end position in original text
+                        # Search for this keyword+number pattern to get position
+                        pattern = re.escape(token) + r'\s*' + re.escape(num_match.group(1))
+                        pos_match = re.search(pattern, text, re.IGNORECASE)
+                        end_pos = pos_match.end() if pos_match else None
+                        return num_match.group(1), end_pos
+
+    return None, None
+
+
 def parse_legal_description(legal_desc: str) -> ParsedLegalDescription:
     """
-    Parse legal description into components.
+    Parse legal description into components with fuzzy keyword matching.
+    Handles typos like "Bolck" for "Block", "Lto" for "Lot", etc.
 
     Examples:
         "Lot 26 Block 2 Lakecrest Forest 3" → lot=26, block=2, subdivision="Lakecrest Forest", section=3
         "Lot 3 Block 1 Atascocita North 2" → lot=3, block=1, subdivision="Atascocita North", section=2
+        "Lot 5 Bolck 2 Atascocita Fortets 11" → lot=5, block=2, subdivision="Atascocita Fortets", section=11
         "Lot 546 Block 22 Kashmere Gardens" → lot=546, block=22, subdivision="Kashmere Gardens", section=None
     """
     result = ParsedLegalDescription(raw=legal_desc or "")
@@ -317,21 +376,47 @@ def parse_legal_description(legal_desc: str) -> ParsedLegalDescription:
 
     text = str(legal_desc).strip()
 
-    # Extract Lot number: "Lot 26" or "LOT 26" or "lot26"
+    # Extract Lot number with fuzzy matching for "lot"
+    # First try strict regex for speed
     lot_match = re.search(r'\bLOT\s*(\d+)\b', text, re.IGNORECASE)
     if lot_match:
         result.lot_number = lot_match.group(1)
+    else:
+        # Fallback to fuzzy matching
+        lot_num, _ = _find_fuzzy_keyword_with_number(text, ["lot"], threshold=70)
+        if lot_num:
+            result.lot_number = lot_num
 
-    # Extract Block number: "Block 2" or "BLOCK 2" or "BLK 2"
+    # Extract Block number with fuzzy matching for "block" or "blk"
+    # First try strict regex for speed
     block_match = re.search(r'\b(?:BLOCK|BLK)\s*(\d+)\b', text, re.IGNORECASE)
+    block_end_pos = None
     if block_match:
         result.block_number = block_match.group(1)
+        block_end_pos = block_match.end()
+    else:
+        # Fallback to fuzzy matching - handles typos like "Bolck", "Blcok", "Bloack", etc.
+        block_num, end_pos = _find_fuzzy_keyword_with_number(text, ["block", "blk"], threshold=70)
+        if block_num:
+            result.block_number = block_num
+            block_end_pos = end_pos
 
     # Extract subdivision name and optional section number
     # Pattern: everything after "Block #" until end, with optional trailing number
-    if block_match:
-        remainder = text[block_match.end():].strip()
+    if block_end_pos:
+        remainder = text[block_end_pos:].strip()
+    elif result.block_number:
+        # We found block via fuzzy match but don't have exact position
+        # Try to find where the block number ends in the text
+        block_pattern = re.search(r'\b\w+\s*' + re.escape(result.block_number) + r'\b', text, re.IGNORECASE)
+        if block_pattern:
+            remainder = text[block_pattern.end():].strip()
+        else:
+            remainder = ""
+    else:
+        remainder = ""
 
+    if remainder:
         # Check if there's a trailing number (section number)
         # e.g., "Lakecrest Forest 3" → subdivision="Lakecrest Forest", section="3"
         section_match = re.search(r'^(.+?)\s+(\d+)\s*$', remainder)
@@ -874,10 +959,8 @@ def build_property_update(dm_record: dict, prop_record: dict) -> tuple[dict, str
 
 # ==================== RESULT MARKING FUNCTIONS ====================
 def mark_success(sf: Salesforce, record_id: str, result: ProcessingResult, fingerprint: str = None, change_summary: str = ""):
-    # choose created vs updated; if you prefer always 'success', flip logic here
+    # choose created vs updated
     pick = PLR_CREATED if (result.status and "Created" in result.status) else PLR_UPDATED
-    if result.needs_review:
-        pick = PLR_REVIEW
 
     # (optional) human detail for logs; not stored
     detail = result.status or ""
@@ -885,6 +968,7 @@ def mark_success(sf: Salesforce, record_id: str, result: ProcessingResult, finge
         detail += f" | match_type={result.match_type}"
     if result.match_score:
         detail += f" | score={result.match_score}"
+
     update_data = {
         'Prop_Last_Run_At__c': sf_datetime_now(),
         'Prop_Last_Result__c': pick,
@@ -894,29 +978,10 @@ def mark_success(sf: Salesforce, record_id: str, result: ProcessingResult, finge
         'Attempt_Count__c': 0,
         'Next_Attempt_At__c': None,
         'Change_Summary__c': (change_summary[:255] if change_summary else None),
-        'Ready_for_Contacts__c': False,
-        
-        # 'Hold_Until__c': None,
+        'Needs_Review__c': False,
+        'Review_Status__c': 'Reviewed',
+        'Ready_for_Contacts__c': True,
     }
-
-    # Only mark "Ready for Contacts" true when a brand-new Property was created
-    created_new = bool(result.status and "Created New" in result.status)
-
-    if result.needs_review:
-        # Needs manual review, so do NOT mark ready for contacts yet
-        update_data.update({
-            'Needs_Review__c': True,
-            'Review_Status__c': 'New',          # lands in your queue
-            'Property__c': (None if result.needs_review else result.property_id),
-            'Ready_for_Contacts__c': False,     # keep contact worker OFF
-        })
-    else:
-        # No review needed
-        update_data.update({
-            'Needs_Review__c': False,
-            'Review_Status__c': 'Reviewed',                 # considered approved
-            'Ready_for_Contacts__c': True,           # checkbox true only when a new Property was created
-        })
     if FINGERPRINT_ENABLED and fingerprint:
         update_data['Prop_Last_Run_Fingerprint__c'] = fingerprint
 
@@ -1207,15 +1272,15 @@ def process_batch(sf: Salesforce) -> Dict[str, int]:
 
         query = f"""
         SELECT Id, SystemModstamp, Property__c,
-            Prop_Last_Run_At__c, Prop_Last_Run_Fingerprint__c, 
+            Prop_Last_Run_At__c, Prop_Last_Run_Fingerprint__c,
             Attempt_Count__c, Next_Attempt_At__c,
             Processing_Lock__c, Lock_Owner__c, Lock_Expires_At__c,
-            Parcel_ID__c, Street_Number__c, Street_Name__c, City__c, State__c, 
+            Parcel_ID__c, Street_Number__c, Street_Name__c, City__c, State__c,
             Zip__c, Legal_Description__c, County__c, Lead_Source__c,
             Total_Appraised_Value__c, Mortgage_Balance__c,
             Foreclosure_Status__c, Delinquent_Taxes_Found__c,
             Property_Type__c, Bedrooms__c, Baths__c, Year_Built__c, Sq_Footage__c,
-            Occupancy_Type__c, Building_Square_Feet__c, Lot_Size_SQFT__c, 
+            Occupancy_Type__c, Building_Square_Feet__c, Lot_Size_SQFT__c,
             Lot_Size_Acres__c, Lot_Dimensions_Length__c, Lot_Dimensions_Width__c,
             Flood_Zone__c, MLS_Status__c, High_Equity__c,
             Appraised_Value_Improvement__c, Appraised_Land_Value__c,
@@ -1234,9 +1299,11 @@ def process_batch(sf: Salesforce) -> Dict[str, int]:
             Mailing_Address__c, Mailing_Address_of_Record__c,
             Mailing_Address_1__c, Mailing_Address_2__c, Mailing_Address_3__c
         FROM Data_Management__c
-        WHERE (Prop_Last_Run_At__c = NULL OR SystemModstamp >= LAST_N_DAYS:{LOOKBACK_DAYS})
-        AND (Next_Attempt_At__c = NULL OR Next_Attempt_At__c <= LAST_N_DAYS:0)
-
+        WHERE (
+            Property__c = null
+            OR Prop_Last_Run_At__c = null
+            OR SystemModstamp >= LAST_N_DAYS:{LOOKBACK_DAYS}
+        )
         ORDER BY SystemModstamp ASC
         LIMIT {BATCH_SIZE}
         """.strip()
