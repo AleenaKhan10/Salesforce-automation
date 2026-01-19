@@ -289,12 +289,151 @@ def fuzzy_match_score(text1: str, text2: str) -> int:
     """Calculate fuzzy match score between two text strings"""
     return fuzz.token_sort_ratio(normalize_text(text1), normalize_text(text2))
 
+
+# ==================== LEGAL DESCRIPTION PARSING ====================
+@dataclass
+class ParsedLegalDescription:
+    """Parsed components of a legal description"""
+    lot_number: Optional[str] = None
+    block_number: Optional[str] = None
+    subdivision_name: Optional[str] = None
+    section_number: Optional[str] = None
+    raw: str = ""
+
+
+def parse_legal_description(legal_desc: str) -> ParsedLegalDescription:
+    """
+    Parse legal description into components.
+
+    Examples:
+        "Lot 26 Block 2 Lakecrest Forest 3" → lot=26, block=2, subdivision="Lakecrest Forest", section=3
+        "Lot 3 Block 1 Atascocita North 2" → lot=3, block=1, subdivision="Atascocita North", section=2
+        "Lot 546 Block 22 Kashmere Gardens" → lot=546, block=22, subdivision="Kashmere Gardens", section=None
+    """
+    result = ParsedLegalDescription(raw=legal_desc or "")
+
+    if not legal_desc:
+        return result
+
+    text = str(legal_desc).strip()
+
+    # Extract Lot number: "Lot 26" or "LOT 26" or "lot26"
+    lot_match = re.search(r'\bLOT\s*(\d+)\b', text, re.IGNORECASE)
+    if lot_match:
+        result.lot_number = lot_match.group(1)
+
+    # Extract Block number: "Block 2" or "BLOCK 2" or "BLK 2"
+    block_match = re.search(r'\b(?:BLOCK|BLK)\s*(\d+)\b', text, re.IGNORECASE)
+    if block_match:
+        result.block_number = block_match.group(1)
+
+    # Extract subdivision name and optional section number
+    # Pattern: everything after "Block #" until end, with optional trailing number
+    if block_match:
+        remainder = text[block_match.end():].strip()
+
+        # Check if there's a trailing number (section number)
+        # e.g., "Lakecrest Forest 3" → subdivision="Lakecrest Forest", section="3"
+        section_match = re.search(r'^(.+?)\s+(\d+)\s*$', remainder)
+        if section_match:
+            result.subdivision_name = section_match.group(1).strip()
+            result.section_number = section_match.group(2)
+        else:
+            # No trailing number, entire remainder is subdivision name
+            result.subdivision_name = remainder if remainder else None
+
+    return result
+
+
+def structured_legal_match(legal1: str, legal2: str) -> Tuple[bool, int, str]:
+    """
+    Compare two legal descriptions with structured matching.
+
+    Hard checks (must ALL match exactly, else hard_fail=True):
+        - Lot number
+        - Block number
+        - Section number (if present in both)
+
+    Fuzzy check (only if all hard checks pass):
+        - Subdivision name
+
+    Returns:
+        Tuple of (hard_fail, score, reason)
+        - hard_fail: True if any number doesn't match (should create new property)
+        - score: fuzzy score of subdivision name (only meaningful if hard_fail=False)
+        - reason: explanation of match result
+    """
+    parsed1 = parse_legal_description(legal1)
+    parsed2 = parse_legal_description(legal2)
+
+    # Log parsed values for debugging
+    logger.debug(f"Parsed legal1: lot={parsed1.lot_number}, block={parsed1.block_number}, "
+                f"subdiv={parsed1.subdivision_name}, section={parsed1.section_number}")
+    logger.debug(f"Parsed legal2: lot={parsed2.lot_number}, block={parsed2.block_number}, "
+                f"subdiv={parsed2.subdivision_name}, section={parsed2.section_number}")
+
+    # If NEITHER has structured data, cannot do structured matching
+    # Return no hard fail but low score
+    if not parsed1.lot_number and not parsed2.lot_number:
+        if legal1 and legal2:
+            score = fuzzy_match_score(legal1, legal2)
+            return False, score, "no_structured_data_fallback_fuzzy"
+        return False, 0, "both_empty"
+
+    # === HARD CHECK: Lot number ===
+    if parsed1.lot_number and parsed2.lot_number:
+        if parsed1.lot_number != parsed2.lot_number:
+            logger.info(f"HARD FAIL: Lot mismatch {parsed1.lot_number} != {parsed2.lot_number}")
+            return True, 0, f"lot_mismatch:{parsed1.lot_number}!={parsed2.lot_number}"
+    elif parsed1.lot_number or parsed2.lot_number:
+        # One has lot, other doesn't - hard fail
+        logger.info(f"HARD FAIL: Lot missing one side ({parsed1.lot_number} vs {parsed2.lot_number})")
+        return True, 0, "lot_missing_one_side"
+
+    # === HARD CHECK: Block number ===
+    if parsed1.block_number and parsed2.block_number:
+        if parsed1.block_number != parsed2.block_number:
+            logger.info(f"HARD FAIL: Block mismatch {parsed1.block_number} != {parsed2.block_number}")
+            return True, 0, f"block_mismatch:{parsed1.block_number}!={parsed2.block_number}"
+    elif parsed1.block_number or parsed2.block_number:
+        # One has block, other doesn't - hard fail
+        logger.info(f"HARD FAIL: Block missing one side ({parsed1.block_number} vs {parsed2.block_number})")
+        return True, 0, "block_missing_one_side"
+
+    # === HARD CHECK: Section number (if both present) ===
+    if parsed1.section_number and parsed2.section_number:
+        if parsed1.section_number != parsed2.section_number:
+            logger.info(f"HARD FAIL: Section mismatch {parsed1.section_number} != {parsed2.section_number}")
+            return True, 0, f"section_mismatch:{parsed1.section_number}!={parsed2.section_number}"
+
+    # === ALL HARD CHECKS PASSED ===
+    # Now do fuzzy check on subdivision name
+    if parsed1.subdivision_name and parsed2.subdivision_name:
+        subdiv_score = fuzzy_match_score(parsed1.subdivision_name, parsed2.subdivision_name)
+        logger.info(f"Hard checks passed. Subdivision fuzzy score: {subdiv_score}")
+        return False, subdiv_score, f"subdivision_fuzzy:{subdiv_score}"
+    elif not parsed1.subdivision_name and not parsed2.subdivision_name:
+        # Both have lot/block but no subdivision - all numbers matched, consider it a match
+        return False, 100, "all_numbers_match_no_subdivision"
+    else:
+        # One has subdivision, other doesn't - numbers match but partial data
+        return False, 80, "numbers_match_subdivision_partial"
+
 def find_property_match(sf: Salesforce, new_record: Dict) -> Tuple[Optional[str], str, int]:
     parcel_id = normalize_parcel_id(new_record.get('Parcel_ID__c', ''), new_record.get('County__c', ''))
-    
-    # Use street-only for address matching to match what's stored in Properties
-    street_address = _build_address_line(new_record)  # "123 Main St"
-    legal_desc = new_record.get('Legal_Description__c', '')
+
+    # Extract incoming address components
+    incoming_street_number = str(new_record.get('Street_Number__c') or '').strip()
+    # Normalize street number (handle floats like 843.0 -> "843")
+    if incoming_street_number:
+        try:
+            if '.' in incoming_street_number:
+                incoming_street_number = str(int(float(incoming_street_number)))
+        except (ValueError, TypeError):
+            pass
+
+    incoming_street_name = str(new_record.get('Street_Name__c') or '').strip()
+    legal_desc = str(new_record.get('Legal_Description__c') or '').strip()
 
     # Keep both raw and normalized parcel forms
     raw_incoming_parcel = (new_record.get('Parcel_ID__c') or "").strip().upper()
@@ -303,26 +442,21 @@ def find_property_match(sf: Salesforce, new_record: Dict) -> Tuple[Optional[str]
     city = (new_record.get('City__c') or "").replace("'", "\\'")
     state = (new_record.get('State__c') or "").replace("'", "\\'")
     # Normalize ZIP to first 5 digits only to avoid ZIP+4 mismatch issues
-    # e.g., "773731234" and "77373" should both match
     zipc = re.sub(r'\D','', str(new_record.get('Zip__c') or ""))[:5]
 
-    where = ["(Parcel_ID__c != null OR Left_Main__Address__c != null)"]
+    where = ["(Parcel_ID__c != null OR Left_Main__Address__c != null OR Legal_Description__c != null)"]
 
-    # Use city as a soft filter so we still pick up records where city is missing
-    # Example: first load had no city (Property city is null), later load has city
-    # We want both to be considered for matching instead of forcing a new Property
     if city:
         where.append(f"(Left_Main__City__c = '{city}' OR Left_Main__City__c = null)")
-
     if state:
         where.append(f"Left_Main__State__c = '{state}'")
     if zipc:
-        # Use LIKE to match both 5-digit and ZIP+4 formats
         where.append(f"Left_Main__Zip_Code__c LIKE '{zipc}%'")
 
     query = f"""
       SELECT Id, Parcel_ID__c, Left_Main__Address__c, Legal_Description__c,
-             Left_Main__City__c, Left_Main__State__c, Left_Main__Zip_Code__c
+             Left_Main__City__c, Left_Main__State__c, Left_Main__Zip_Code__c,
+             Street_Number__c, Street_Address__c
       FROM Left_Main__Property__c
       WHERE {" AND ".join(where)}
       LIMIT 2000
@@ -342,43 +476,120 @@ def find_property_match(sf: Salesforce, new_record: Dict) -> Tuple[Optional[str]
     best_score = 0
     match_reason = 'no_match'
 
+    logger.info(f"Matching incoming: street_num={incoming_street_number}, street_name={incoming_street_name}, legal={legal_desc[:50]}...")
+
     for prop in existing_properties:
-        # Priority 1: Parcel ID match (try both normalized and raw)
+        prop_id = prop['Id']
+
+        # ========== PRIORITY 1: PARCEL ID EXACT MATCH ==========
         prop_raw_parcel = (prop.get('Parcel_ID__c') or "").strip().upper()
         prop_norm_parcel = normalize_parcel_id(prop_raw_parcel, new_record.get('County__c', ''))
 
         if norm_incoming_parcel and prop_norm_parcel == norm_incoming_parcel:
-            return prop['Id'], 'parcel_match', 100
+            logger.info(f"PARCEL MATCH: {prop_id} (parcel={norm_incoming_parcel})")
+            return prop_id, 'parcel_match', 100
         if raw_incoming_parcel and prop_raw_parcel == raw_incoming_parcel:
-            return prop['Id'], 'parcel_match', 100
+            logger.info(f"PARCEL MATCH (raw): {prop_id} (parcel={raw_incoming_parcel})")
+            return prop_id, 'parcel_match', 100
 
-        # Priority 2: Combined address and legal description fuzzy match
-        if street_address and legal_desc:
-            # Compare street-to-street (apples to apples)
-            addr_score = fuzzy_match_score(street_address, prop.get('Left_Main__Address__c', ''))
-            legal_score = fuzzy_match_score(legal_desc, prop.get('Legal_Description__c', ''))
-            combined_score = (addr_score + legal_score) / 2
+        # ========== PRIORITY 2: STRUCTURED MATCHING ==========
+        # HARD CHECKS (any mismatch = skip this property entirely):
+        #   - Street Number
+        #   - Lot Number
+        #   - Block Number
+        #   - Section Number
+        # FUZZY CHECKS (only if all hard checks pass):
+        #   - Street Name
+        #   - Subdivision Name
 
-            if combined_score >= MATCH_THRESHOLD_STRONG:
-                return prop['Id'], 'strong_fuzzy_match', int(combined_score)
-            elif combined_score >= MATCH_THRESHOLD_REVIEW and combined_score > best_score:
-                best_match_id = prop['Id']
-                best_score = combined_score
-                match_reason = 'needs_review'
+        # --- Extract property's street components ---
+        prop_street_number = str(prop.get('Street_Number__c') or '').strip()
+        if not prop_street_number and prop.get('Left_Main__Address__c'):
+            addr_parts = str(prop.get('Left_Main__Address__c')).split()
+            if addr_parts and addr_parts[0].isdigit():
+                prop_street_number = addr_parts[0]
 
-        # Priority 3: Address-only fuzzy match
-        elif street_address:
-            # Compare street-to-street consistently
-            addr_score = fuzzy_match_score(street_address, prop.get('Left_Main__Address__c', ''))
-            
-            if addr_score >= MATCH_THRESHOLD_STRONG:
-                return prop['Id'], 'address_match', int(addr_score)
-            elif addr_score >= MATCH_THRESHOLD_REVIEW and addr_score > best_score:
-                best_match_id = prop['Id']
-                best_score = addr_score
-                match_reason = 'needs_review'
-    
-    return best_match_id, match_reason, int(best_score)
+        # Normalize property street number
+        if prop_street_number:
+            try:
+                if '.' in prop_street_number:
+                    prop_street_number = str(int(float(prop_street_number)))
+            except (ValueError, TypeError):
+                pass
+
+        prop_street_name = str(prop.get('Street_Address__c') or '').strip()
+        if not prop_street_name and prop.get('Left_Main__Address__c'):
+            addr_parts = str(prop.get('Left_Main__Address__c')).split(None, 1)
+            if len(addr_parts) > 1:
+                prop_street_name = addr_parts[1]
+
+        prop_legal_desc = str(prop.get('Legal_Description__c') or '').strip()
+
+        # === HARD CHECK 1: Street Number ===
+        if incoming_street_number and prop_street_number:
+            if incoming_street_number != prop_street_number:
+                logger.debug(f"Property {prop_id}: SKIP - Street number mismatch ({incoming_street_number} != {prop_street_number})")
+                continue  # HARD FAIL - move to next property
+
+        # === HARD CHECK 2: Legal Description (Lot, Block, Section numbers) ===
+        legal_hard_fail = False
+        legal_score = 0
+        legal_reason = ""
+
+        if legal_desc and prop_legal_desc:
+            legal_hard_fail, legal_score, legal_reason = structured_legal_match(legal_desc, prop_legal_desc)
+
+            if legal_hard_fail:
+                logger.info(f"Property {prop_id}: SKIP - Legal hard fail: {legal_reason}")
+                continue  # HARD FAIL - move to next property
+
+        # === ALL HARD CHECKS PASSED - Now calculate fuzzy score ===
+
+        # Fuzzy: Street Name
+        street_name_score = 0
+        if incoming_street_name and prop_street_name:
+            street_name_score = fuzzy_match_score(incoming_street_name, prop_street_name)
+
+        # Calculate combined score from fuzzy components
+        scores = []
+        if legal_score > 0:
+            scores.append(legal_score)
+        if street_name_score > 0:
+            scores.append(street_name_score)
+
+        if scores:
+            combined_score = sum(scores) / len(scores)
+        else:
+            # No fuzzy scores but all hard checks passed
+            # This means numbers match but no text to fuzzy match
+            combined_score = 85  # High confidence since numbers matched
+
+        # Boost if street number matched exactly
+        if incoming_street_number and prop_street_number and incoming_street_number == prop_street_number:
+            combined_score = min(100, combined_score + 5)
+
+        logger.info(f"Property {prop_id}: legal_score={legal_score} ({legal_reason}), "
+                   f"street_name_score={street_name_score}, combined={combined_score}")
+
+        # === MATCH DECISION ===
+        # All hard checks passed → this is a MATCH
+        # No "needs_review" - either it matches or it doesn't
+        if combined_score >= MATCH_THRESHOLD_REVIEW:  # Using lower threshold since hard checks already passed
+            logger.info(f"MATCH FOUND: {prop_id} (score={combined_score})")
+            return prop_id, 'address_match', int(combined_score)
+        elif combined_score > best_score:
+            # Keep track of best potential match
+            best_match_id = prop_id
+            best_score = combined_score
+            match_reason = 'address_match'
+
+    # If we found any match where hard checks passed, use it
+    if best_match_id and best_score > 0:
+        logger.info(f"BEST MATCH: {best_match_id} (score={best_score})")
+        return best_match_id, match_reason, int(best_score)
+
+    logger.info("NO MATCH FOUND - will create new property")
+    return None, 'no_match', 0
 
 
 
@@ -779,13 +990,12 @@ def process_single_record(sf: Salesforce, record: Dict) -> ProcessingResult:
     result = ProcessingResult(success=False)
 
     try:
-        # Step 1: Validate incoming data
+        # Step 1: Validate incoming data (warnings only, don't block processing)
         is_valid, validation_errors = validate_property_data(record)
         if not is_valid:
-            result.error_message = f"Validation failed: {', '.join(validation_errors)}"
-            result.needs_review = True
-            return result
-        
+            logger.warning(f"Validation warnings for {record.get('Id')}: {', '.join(validation_errors)}")
+            # Continue processing anyway - don't block
+
         # Step 2: Find existing property or create new one
         property_id, match_type, match_score = find_property_match(sf, record)
         result.match_score = match_score
@@ -796,15 +1006,9 @@ def process_single_record(sf: Salesforce, record: Dict) -> ProcessingResult:
             result.error_message = "Property match query failed"
             result.needs_review = True
             return result
-        
-        if match_type == 'needs_review':
-            result.needs_review = True
-            result.status = f'Potential Duplicate - Score: {match_score}'
-            result.property_id = property_id
 
-
-
-        elif match_type in ['parcel_match', 'strong_fuzzy_match', 'address_match']:
+        # Match found - update existing property
+        if match_type in ['parcel_match', 'strong_fuzzy_match', 'address_match']:
             # Pull the current Property so we can merge
             prop = sf.Left_Main__Property__c.get(property_id)
 
