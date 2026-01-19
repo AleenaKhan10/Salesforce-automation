@@ -1299,11 +1299,9 @@ def process_batch(sf: Salesforce) -> Dict[str, int]:
             Mailing_Address__c, Mailing_Address_of_Record__c,
             Mailing_Address_1__c, Mailing_Address_2__c, Mailing_Address_3__c
         FROM Data_Management__c
-        WHERE (
-            Property__c = null
-            OR Prop_Last_Run_At__c = null
-            OR SystemModstamp >= LAST_N_DAYS:{LOOKBACK_DAYS}
-        )
+        WHERE (Prop_Last_Run_At__c = NULL OR SystemModstamp >= LAST_N_DAYS:{LOOKBACK_DAYS})
+        AND (Next_Attempt_At__c = NULL OR Next_Attempt_At__c <= LAST_N_DAYS:0)
+
         ORDER BY SystemModstamp ASC
         LIMIT {BATCH_SIZE}
         """.strip()
