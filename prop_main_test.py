@@ -20,7 +20,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass
-from simple_salesforce import Salesforce
+from simple_salesforce import Salesforce, SalesforceMalformedRequest
 from fuzzywuzzy import fuzz
 import pandas as pd
 from dotenv import load_dotenv
@@ -166,13 +166,80 @@ def _safe_prop_payload(sf, payload: dict) -> dict:
     """Drop any keys not present on Left_Main__Property__c to avoid INVALID_FIELD"""
     fields = _property_fields(sf)
     filtered = {k: v for k, v in payload.items() if k in fields}
-    
+
     # Log dropped fields for debugging
     dropped = set(payload.keys()) - set(filtered.keys())
     if dropped:
         logger.debug(f"Dropped {len(dropped)} invalid fields: {dropped}")
-    
+
     return filtered
+
+
+def _handle_duplicate_detection(sf: Salesforce, error: SalesforceMalformedRequest) -> Tuple[Optional[str], str]:
+    """
+    Handle DUPLICATES_DETECTED error from Salesforce.
+
+    When Salesforce's duplicate rule blocks property creation, this function extracts
+    the existing property ID and links to it instead of failing.
+
+    Returns:
+        Tuple of (property_id, status_message)
+        - property_id: The ID of the existing property to link to
+        - status_message: Description of what happened
+    """
+    try:
+        # Parse the error content to extract duplicate info
+        import ast
+
+        # The error content is usually in the format: Response content: [...]
+        if 'Response content:' in str(error):
+            content_str = str(error).split('Response content:')[1].strip()
+            try:
+                error_data = ast.literal_eval(content_str)
+            except:
+                # Try json parsing as fallback
+                error_data = json.loads(content_str)
+        else:
+            # Try to parse the whole error as JSON
+            try:
+                error_data = json.loads(str(error))
+            except:
+                error_data = []
+
+        if not isinstance(error_data, list):
+            error_data = [error_data]
+
+        # Find the duplicate record ID
+        duplicate_property_id = None
+        for err in error_data:
+            if err.get('errorCode') == 'DUPLICATES_DETECTED':
+                dup_result = err.get('duplicateResult', {})
+                match_results = dup_result.get('matchResults', [])
+                for match in match_results:
+                    match_records = match.get('matchRecords', [])
+                    for rec in match_records:
+                        record_data = rec.get('record', {})
+                        if record_data.get('Id'):
+                            duplicate_property_id = record_data['Id']
+                            break
+                    if duplicate_property_id:
+                        break
+            if duplicate_property_id:
+                break
+
+        if not duplicate_property_id:
+            logger.warning("Could not extract duplicate property ID from error")
+            raise error  # Re-raise original error
+
+        logger.info(f"Duplicate detected by Salesforce - linking to existing property {duplicate_property_id}")
+        return duplicate_property_id, f'Linked to Existing (Salesforce duplicate rule matched)'
+
+    except SalesforceMalformedRequest:
+        raise  # Re-raise if it's another Salesforce error
+    except Exception as parse_error:
+        logger.error(f"Error handling duplicate detection: {parse_error}", exc_info=True)
+        raise error  # Re-raise original error if we can't handle it
+
 
 # ==================== LOCKING MECHANISM ====================
 def try_acquire_lock(sf: Salesforce, record_id: str) -> bool:
@@ -1219,21 +1286,36 @@ def process_single_record(sf: Salesforce, record: Dict) -> ProcessingResult:
             
             # Filter to valid fields ONLY
             filtered_data = _safe_prop_payload(sf, property_data)
-            
+
             # Log what we're creating
             logger.info(f"Creating Property with {len(filtered_data)} fields")
             if len(filtered_data) != len(property_data):
                 dropped = len(property_data) - len(filtered_data)
                 logger.warning(f"Dropped {dropped} invalid fields during filtering")
-            
-            # Create the property
-            property_result = sf.Left_Main__Property__c.create(filtered_data)
-            property_id = property_result['id']
-            result.property_id = property_id
-            result.status = 'Created New'
+
+            # Create the property (with duplicate detection handling)
+            try:
+                property_result = sf.Left_Main__Property__c.create(filtered_data)
+                property_id = property_result['id']
+                result.property_id = property_id
+                result.status = 'Created New'
+            except SalesforceMalformedRequest as dup_error:
+                # Check if this is a duplicate detection error
+                if 'DUPLICATES_DETECTED' in str(dup_error):
+                    property_id, status = _handle_duplicate_detection(sf, dup_error)
+                    result.property_id = property_id
+                    result.status = status
+                else:
+                    raise  # Re-raise if it's a different error
 
         result.success = True
         logger.info(f"Successfully processed record {record['Id']}: {result.status}")
+
+    except SalesforceMalformedRequest as e:
+        err_msg = str(e) if str(e).strip() else "Salesforce request error"
+        logger.error(f"Salesforce error processing record {record.get('Id', 'UNKNOWN_ID')}: {err_msg}", exc_info=True)
+        result.error_message = err_msg
+        result.needs_review = True
 
     except Exception as e:
         err_msg = str(e) if str(e).strip() else "Unknown error occurred during processing"
